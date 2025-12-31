@@ -1,0 +1,187 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  workflow_dispatch:
+
+env:
+  AWS_REGION: us-east-2
+  ECR_SERVER_REPOSITORY: todo-app-server
+  ECR_CLIENT_REPOSITORY: todo-app-client
+
+jobs:
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "18"
+          cache: "npm"
+          cache-dependency-path: server/package-lock.json
+
+      - name: Install server dependencies
+        working-directory: ./server
+        run: npm ci
+
+      - name: Run tests
+        working-directory: ./server
+        run: npm test
+        env:
+          CI: true
+
+  build-and-push:
+    name: Build and Push Docker Images
+    needs: test
+    runs-on: ubuntu-latest
+    outputs:
+      server-image: ${{ steps.meta-server.outputs.tags }}
+      client-image: ${{ steps.meta-client.outputs.tags }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Get AWS account ID
+        id: account
+        run: |
+          echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+      - name: Build, tag, and push server image
+        id: meta-server
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ env.ECR_SERVER_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest ./server
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "tags=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG,$ECR_REGISTRY/$ECR_REPOSITORY:latest" >> $GITHUB_OUTPUT
+
+      - name: Build, tag, and push client image
+        id: meta-client
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          ECR_REPOSITORY: ${{ env.ECR_CLIENT_REPOSITORY }}
+          IMAGE_TAG: ${{ github.sha }}
+          VITE_API_BASE_URL: ${{ secrets.VITE_API_BASE_URL }}
+        run: |
+          docker build --build-arg VITE_API_BASE_URL=$VITE_API_BASE_URL -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG -t $ECR_REGISTRY/$ECR_REPOSITORY:latest ./client
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          echo "tags=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG,$ECR_REGISTRY/$ECR_REPOSITORY:latest" >> $GITHUB_OUTPUT
+
+  deploy:
+    name: Deploy to EC2
+    needs: build-and-push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get EC2 instance IP
+        id: terraform-output
+        run: |
+          # Try to get IP from Terraform output, fallback to secret
+          INSTANCE_IP="${{ secrets.EC2_INSTANCE_IP }}"
+          if [ -z "$INSTANCE_IP" ]; then
+            echo "⚠️ EC2_INSTANCE_IP secret not set. Please set it in GitHub Secrets."
+            exit 1
+          fi
+          echo "instance_ip=$INSTANCE_IP" >> $GITHUB_OUTPUT
+
+      - name: Get AWS account ID
+        id: account
+        run: |
+          echo "account_id=$(aws sts get-caller-identity --query Account --output text)" >> $GITHUB_OUTPUT
+
+      - name: Setup SSH
+        run: |
+          mkdir -p ~/.ssh
+          echo "${{ secrets.EC2_SSH_PRIVATE_KEY }}" > ~/.ssh/deploy_key
+          chmod 600 ~/.ssh/deploy_key
+          ssh-keyscan -H ${{ steps.terraform-output.outputs.instance_ip }} >> ~/.ssh/known_hosts
+
+      - name: Deploy to EC2
+        run: |
+          ECR_REGISTRY="${{ steps.account.outputs.account_id }}.dkr.ecr.${{ env.AWS_REGION }}.amazonaws.com"
+          ECR_SERVER_IMAGE="$ECR_REGISTRY/${{ env.ECR_SERVER_REPOSITORY }}:latest"
+          ECR_CLIENT_IMAGE="$ECR_REGISTRY/${{ env.ECR_CLIENT_REPOSITORY }}:latest"
+          
+          # Create deployment script
+          cat > /tmp/deploy.sh << DEPLOYSCRIPT
+          #!/bin/bash
+          set -e
+          cd /home/ubuntu/app
+          
+          export ECR_REGISTRY="$ECR_REGISTRY"
+          export ECR_SERVER_IMAGE="$ECR_SERVER_IMAGE"
+          export ECR_CLIENT_IMAGE="$ECR_CLIENT_IMAGE"
+          export MONGODB_ATLAS_CONNECTION="${{ secrets.MONGODB_ATLAS_CONNECTION }}"
+          export AWS_REGION="${{ env.AWS_REGION }}"
+          
+          # Login to ECR
+          aws ecr get-login-password --region \$AWS_REGION | docker login --username AWS --password-stdin \$ECR_REGISTRY
+          
+          # Create docker-compose.yml
+          cat > docker-compose.yml << 'COMPOSEEOF'
+          version: "3.9"
+          
+          services:
+            server:
+              image: \${ECR_SERVER_IMAGE}
+              environment: 
+                - MONGODB_ATLAS_CONNECTION=\${MONGODB_ATLAS_CONNECTION}
+                - PORT=8000
+              ports:
+                - "8000:8000"
+              restart: unless-stopped
+          
+            client:
+              image: \${ECR_CLIENT_IMAGE}
+              ports:
+                - "3000:3000"
+              restart: unless-stopped
+              depends_on:
+                - server
+          COMPOSEEOF
+          
+          # Pull latest images and restart containers
+          docker compose pull
+          docker compose down || true
+          docker compose up -d
+          
+          # Clean up old images
+          docker image prune -af --filter "until=24h"
+          
+          echo "✅ Deployment completed successfully!"
+          DEPLOYSCRIPT
+          
+          # Copy and execute deployment script
+          scp -i ~/.ssh/deploy_key /tmp/deploy.sh ubuntu@${{ steps.terraform-output.outputs.instance_ip }}:/tmp/deploy.sh
+          ssh -i ~/.ssh/deploy_key ubuntu@${{ steps.terraform-output.outputs.instance_ip }} 'bash /tmp/deploy.sh'

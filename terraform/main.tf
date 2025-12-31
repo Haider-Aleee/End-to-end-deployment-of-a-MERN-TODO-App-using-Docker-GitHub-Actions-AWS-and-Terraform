@@ -26,11 +26,15 @@ resource "aws_internet_gateway" "gw" {
   }
 }
 
+data "aws_availability_zones" "available" {
+  state = "available"
+}
+
 resource "aws_subnet" "public_1" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.1.0/24"
-  availability_zone       = "us-east-2a" # Use an appropriate AZ for your region
-  map_public_ip_on_launch = true         # Automatically assign public IPs to instances
+  availability_zone       = data.aws_availability_zones.available.names[0]
+  map_public_ip_on_launch = true
 
   tags = {
     Name = "PublicSubnet1"
@@ -40,8 +44,8 @@ resource "aws_subnet" "public_1" {
 resource "aws_subnet" "public_2" {
   vpc_id                  = aws_vpc.main.id
   cidr_block              = "10.0.2.0/24"
-  availability_zone       = "us-east-2b" # Use an appropriate AZ for your region
-  map_public_ip_on_launch = true         # Automatically assign public IPs to instances
+  availability_zone       = data.aws_availability_zones.available.names[1]
+  map_public_ip_on_launch = true
 
   tags = {
     Name = "PublicSubnet2"
@@ -51,7 +55,7 @@ resource "aws_subnet" "public_2" {
 resource "aws_subnet" "private" {
   vpc_id            = aws_vpc.main.id
   cidr_block        = "10.0.10.0/24"
-  availability_zone = "us-east-2a"
+  availability_zone = data.aws_availability_zones.available.names[0]
 
   tags = {
     Name = "PrivateSubnet"
@@ -199,8 +203,8 @@ resource "aws_iam_instance_profile" "ec2_instance_profile" {
   role = aws_iam_role.ec2_role.name
 }
 
-resource "aws_ecr_repository" "ecr_repo" {
-  name                 = "TODO-app"
+resource "aws_ecr_repository" "ecr_repo_server" {
+  name                 = "todo-app-server"
   image_tag_mutability = "MUTABLE"
 
   image_scanning_configuration {
@@ -208,36 +212,51 @@ resource "aws_ecr_repository" "ecr_repo" {
   }
 }
 
-resource "aws_ecr_lifecycle_policy" "example_policy" {
-  repository = aws_ecr_repository.ecr_repo.name
+resource "aws_ecr_repository" "ecr_repo_client" {
+  name                 = "todo-app-client"
+  image_tag_mutability = "MUTABLE"
+
+  image_scanning_configuration {
+    scan_on_push = true
+  }
+}
+
+resource "aws_ecr_lifecycle_policy" "server_policy" {
+  repository = aws_ecr_repository.ecr_repo_server.name
 
   policy = jsonencode({
     rules = [
       {
-        # Rule 1: Expire untagged images older than 7 days
-        "rulePriority" : 1,
-        "description" : "Expire untagged images older than 7 days",
-        "selection" : {
-          "tagStatus" : "untagged",
-          "countType" : "sinceImagePushed",
-          "countNumber" : 7,
-          "countUnit" : "days"
-        },
-        "action" : {
-          "type" : "expire"
+        rulePriority = 1
+        description  = "Keep last 10 images"
+        selection = {
+          tagStatus   = "any"
+          countType   = "imageCountMoreThan"
+          countNumber = 10
         }
-      },
+        action = {
+          type = "expire"
+        }
+      }
+    ]
+  })
+}
+
+resource "aws_ecr_lifecycle_policy" "client_policy" {
+  repository = aws_ecr_repository.ecr_repo_client.name
+
+  policy = jsonencode({
+    rules = [
       {
-        # Rule 2: Keep only the 5 most recent untagged images
-        "rulePriority" : 2,
-        "description" : "Keep only the 5 most recent untagged images",
-        "selection" : {
-          "tagStatus" : "untagged",
-          "countType" : "imageCountMoreThan",
-          "countNumber" : 5
-        },
-        "action" : {
-          "type" : "expire"
+        rulePriority = 1
+        description  = "Keep last 10 images"
+        selection = {
+          tagStatus   = "any"
+          countType   = "imageCountMoreThan"
+          countNumber = 10
+        }
+        action = {
+          type = "expire"
         }
       }
     ]
@@ -260,8 +279,8 @@ data "aws_ami" "ubuntu_2204" {
 }
 
 resource "aws_key_pair" "todo-server-key" {
-  key_name   = "todo-instane-key-pair"
-  public_key = file("/home/haider/Downloads/Research-server-key-pair.pem")
+  key_name   = var.key_pair_name
+  public_key = file(var.key_pair_public_key_path)
 }
 
 

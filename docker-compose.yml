@@ -1,0 +1,51 @@
+version: "3.9"
+
+services:
+  server:
+    image: backend-app
+    environment: 
+      - MONGODB_ATLAS_CONNECTION=${MONGODB_ATLAS_CONNECTION:-}
+      - PORT=8000
+    ports:
+      - "8000:8000"
+    build:
+      context: ./server
+      dockerfile: Dockerfile
+    volumes:
+      - ./server:/app
+    networks:
+      - app-network
+
+  client:
+    image: frontend-app
+    environment:
+      - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:8000/api}
+    ports:
+      - "3000:3000"
+    build:
+      context: ./client
+      dockerfile: Dockerfile
+      args:
+        - VITE_API_BASE_URL=${VITE_API_BASE_URL:-http://localhost:8000/api}
+    depends_on:
+      - server
+    networks:
+      - app-network
+
+  mongo:
+    image: mongo:latest
+    container_name: mongo
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongo-data:/data/db
+    networks:
+      - app-network
+
+volumes:
+  mongo-data:
+    driver: local
+
+networks:
+  app-network:
+    driver: bridge
